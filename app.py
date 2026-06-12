@@ -161,26 +161,31 @@ def spatial_distribution_score(centroids, img_shape):
     return round(float(np.clip(R / 2.15, 0, 1)), 4)
 
 
-def build_results_df(valid_cells):
+def build_results_df(valid_cells, use_microns=False, scale_px_per_um=None):
+    px_to_um2 = (1.0 / scale_px_per_um**2) if (use_microns and scale_px_per_um) else None
+    area_col  = "Area (µm²)" if px_to_um2 else "Area (px²)"
     rows = []
     for idx, (region, circ) in enumerate(valid_cells, 1):
+        area_val = region.area * px_to_um2 if px_to_um2 else int(region.area)
         rows.append({
             "Cell #":         idx,
-            "Area (px²)":     int(region.area),
+            area_col:         round(float(area_val), 4) if px_to_um2 else int(area_val),
             "Mean Intensity": round(float(get_region_mean_intensity(region)), 2),
             "Circularity":    round(circ, 4),
             "Centroid X":     round(region.centroid[1], 2),
             "Centroid Y":     round(region.centroid[0], 2),
         })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), area_col
 
 
-def build_summary(df, cell_channel, valid_cells, img_shape):
+def build_summary(df, area_col, cell_channel, valid_cells, img_shape, use_microns=False, scale_px_per_um=None):
     if df.empty:
         return pd.DataFrame()
 
     total_px       = img_shape[0] * img_shape[1]
-    cell_area_tot  = df["Area (px²)"].sum()
+    # % area always computed in pixels regardless of display unit
+    area_px_values = df[area_col] * (scale_px_per_um**2) if (use_microns and scale_px_per_um) else df[area_col]
+    cell_area_tot  = area_px_values.sum()
     pct_area       = round(100.0 * cell_area_tot / total_px, 4)
 
     cell_mask = np.zeros(img_shape[:2], dtype=bool)
@@ -191,9 +196,11 @@ def build_summary(df, cell_channel, valid_cells, img_shape):
     centroids = [(r.centroid[0], r.centroid[1]) for r, _ in valid_cells]
     spatial   = spatial_distribution_score(centroids, img_shape)
 
+    area_label = f"Average Area (µm²)" if (use_microns and scale_px_per_um) else "Average Area (px²)"
+
     return pd.DataFrame([{
         "Total Cells Detected":        len(df),
-        "Average Area (px²)":          round(df["Area (px²)"].mean(), 2),
+        area_label:                    round(float(df[area_col].mean()), 4),
         "Average Circularity":         round(df["Circularity"].mean(), 4),
         "Average Cell Intensity":      round(df["Mean Intensity"].mean(), 2),
         "Average Background Intensity":round(bg_intensity, 2),
@@ -233,6 +240,21 @@ with st.sidebar:
 
     st.markdown("**Display**")
     outline_color = st.selectbox("Outline Colour", ["yellow","cyan","magenta","white"])
+
+    st.markdown("**Units**")
+    use_microns = st.checkbox("Show area in µm²", value=False)
+    scale_px_per_um = None
+    if use_microns:
+        scale_px_per_um = st.number_input(
+            "Scale (pixels per µm)",
+            min_value=0.01,
+            max_value=1000.0,
+            value=1.0,
+            step=0.1,
+            help="Enter the pixel-to-micron scale for your microscope/objective. "
+                 "e.g. if 1 µm = 4.5 pixels, enter 4.5"
+        )
+        st.caption(f"1 px² = {1/scale_px_per_um**2:.4f} µm²")
 
 
 # ─────────────────────────────────────────────────
@@ -287,8 +309,8 @@ with st.spinner("Analysing cells…"):
         cell_channel, min_area, min_circ, max_circ, min_intensity,
         threshold_method=tm, manual_threshold=manual_thresh
     )
-    results_df  = build_results_df(valid_cells)
-    summary_df  = build_summary(results_df, cell_channel, valid_cells, img_array.shape)
+    results_df, area_col = build_results_df(valid_cells, use_microns, scale_px_per_um)
+    summary_df  = build_summary(results_df, area_col, cell_channel, valid_cells, img_array.shape, use_microns, scale_px_per_um)
     overlay_img = build_overlay(img_array, labels, valid_cells, outline_color)
 
 
@@ -296,11 +318,12 @@ with st.spinner("Analysing cells…"):
 st.markdown("---")
 m1,m2,m3,m4,m5 = st.columns(5)
 n = len(results_df)
-m1.metric("🦠 Cells",          n)
-m2.metric("📐 Avg Area (px²)",  f"{results_df['Area (px²)'].mean():.1f}"    if n else "—")
-m3.metric("⭕ Avg Circularity", f"{results_df['Circularity'].mean():.3f}"   if n else "—")
-m4.metric("💡 Avg Intensity",   f"{results_df['Mean Intensity'].mean():.1f}" if n else "—")
-m5.metric("🗺️ Spatial Score",  f"{summary_df['Spatial Distribution (0–1)'].iloc[0]:.3f}" if n else "—")
+area_unit = "µm²" if (use_microns and scale_px_per_um) else "px²"
+m1.metric("🦠 Cells",                    n)
+m2.metric(f"📐 Avg Area ({area_unit})",  f"{results_df[area_col].mean():.2f}"    if n else "—")
+m3.metric("⭕ Avg Circularity",          f"{results_df['Circularity'].mean():.3f}"   if n else "—")
+m4.metric("💡 Avg Intensity",            f"{results_df['Mean Intensity'].mean():.1f}" if n else "—")
+m5.metric("🗺️ Spatial Score",           f"{summary_df['Spatial Distribution (0–1)'].iloc[0]:.3f}" if n else "—")
 
 
 # ─── Annotated image ─────────────────────────────
@@ -338,14 +361,15 @@ st.markdown('<div class="section-title">📊 Individual Cell Measurements</div>'
 if results_df.empty:
     st.warning("No cells detected. Try reducing Min Area or Min Intensity in the sidebar.")
 else:
+    fmt = {
+        area_col:         "{:,.4f}" if (use_microns and scale_px_per_um) else "{:,}",
+        "Mean Intensity": "{:.2f}",
+        "Circularity":    "{:.4f}",
+        "Centroid X":     "{:.2f}",
+        "Centroid Y":     "{:.2f}",
+    }
     st.dataframe(
-        results_df.style.format({
-            "Area (px²)":     "{:,}",
-            "Mean Intensity": "{:.2f}",
-            "Circularity":    "{:.4f}",
-            "Centroid X":     "{:.2f}",
-            "Centroid Y":     "{:.2f}",
-        }),
+        results_df.style.format(fmt),
         use_container_width=True,
         height=min(420, 40 + 36*len(results_df)),
     )
