@@ -226,21 +226,6 @@ def fig_to_bytes(fig):
 with st.sidebar:
     st.markdown("## ⚙️ Analysis Parameters")
 
-    st.markdown("**Segmentation Filters**")
-    min_area      = st.slider("Min Cell Area (px²)",   10, 2000, 50,  10)
-    min_circ      = st.slider("Min Circularity",       0.0, 1.0, 0.1, 0.01)
-    max_circ      = st.slider("Max Circularity",       0.0, 1.0, 1.0, 0.01)
-    min_intensity = st.slider("Min Mean Intensity",    0,   255,  15,  1)
-
-    st.markdown("**Thresholding**")
-    thresh_method = st.radio("Method", ["Otsu (auto)", "Manual"], index=0)
-    manual_thresh = None
-    if thresh_method == "Manual":
-        manual_thresh = st.slider("Manual Threshold", 0, 255, 30, 1)
-
-    st.markdown("**Display**")
-    outline_color = st.selectbox("Outline Colour", ["yellow","cyan","magenta","white"])
-
     st.markdown("**Units**")
     use_microns = st.checkbox("Show area in µm²", value=False)
     scale_px_per_um = None
@@ -255,6 +240,36 @@ with st.sidebar:
                  "e.g. if 1 µm = 4.5 pixels, enter 4.5"
         )
         st.caption(f"1 px² = {1/scale_px_per_um**2:.4f} µm²")
+
+    st.markdown("**Segmentation Filters**")
+    # Min area slider — label and range switch with unit toggle
+    if use_microns and scale_px_per_um:
+        um2_per_px2   = 1.0 / scale_px_per_um ** 2
+        min_area_um2  = st.slider(
+            "Min Cell Area (µm²)",
+            min_value=round(10  * um2_per_px2, 4),
+            max_value=round(2000 * um2_per_px2, 2),
+            value=round(50  * um2_per_px2, 4),
+            step=round(10  * um2_per_px2, 4),
+            format="%.4f",
+        )
+        st.caption(f"= {min_area_um2 / um2_per_px2:.0f} px²")
+        min_area = int(min_area_um2 / um2_per_px2)   # convert back to px for segmentation
+    else:
+        min_area = st.slider("Min Cell Area (px²)", 10, 2000, 50, 10)
+
+    min_circ      = st.slider("Min Circularity",    0.0, 1.0, 0.1, 0.01)
+    max_circ      = st.slider("Max Circularity",    0.0, 1.0, 1.0, 0.01)
+    min_intensity = st.slider("Min Mean Intensity", 0,   255,  15,  1)
+
+    st.markdown("**Thresholding**")
+    thresh_method = st.radio("Method", ["Otsu (auto)", "Manual"], index=0)
+    manual_thresh = None
+    if thresh_method == "Manual":
+        manual_thresh = st.slider("Manual Threshold", 0, 255, 30, 1)
+
+    st.markdown("**Display**")
+    outline_color = st.selectbox("Outline Colour", ["yellow","cyan","magenta","white"])
 
 
 # ─────────────────────────────────────────────────
