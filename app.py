@@ -4,6 +4,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 from PIL import Image
 from skimage.measure import label, regionprops
 from skimage.filters import threshold_otsu
@@ -114,6 +115,101 @@ def build_overlay(img_array, labels, valid_cells, outline_color):
     return disp
 
 
+def build_interactive_overlay(overlay_img, valid_cells, results_df, area_col,
+                              ch_name, use_microns, scale_px_per_um):
+    """
+    Build a Plotly figure showing the annotated overlay image where hovering
+    over a detected cell pops up a tooltip with that cell's measurements
+    (Cell #, Area, Mean Intensity, Circularity, Centroid).
+    """
+    h, w = overlay_img.shape[0], overlay_img.shape[1]
+
+    fig = go.Figure()
+
+    # Background image (the outlined overlay) — pinned to pixel coordinates
+    fig.add_layout_image(
+        dict(
+            source=Image.fromarray(overlay_img),
+            xref="x", yref="y",
+            x=0, y=0,
+            sizex=w, sizey=h,
+            sizing="stretch",
+            layer="below",
+        )
+    )
+
+    area_unit = "µm²" if (use_microns and scale_px_per_um) else "px²"
+    # Plotly marker `size` is in screen pixels, not data units, so scale the
+    # hover-target radius relative to the image's longest side rather than
+    # using raw pixel coordinates (keeps hover targets sensible for both
+    # small thumbnails and large microscopy images).
+    longest_side = max(h, w)
+    render_px    = 480  # approx rendered height set below; used for scaling
+
+    if not results_df.empty:
+        for (region, circ), (_, row) in zip(valid_cells, results_df.iterrows()):
+            cy, cx = region.centroid  # row, col -> y, x
+            area_val = row[area_col]
+            mi       = row["Mean Intensity"]
+            hover_text = (
+                f"<b>Cell #{int(row['Cell #'])}</b><br>"
+                f"Channel: {ch_name}<br>"
+                f"Area: {area_val:,.2f} {area_unit}<br>"
+                f"Mean Intensity: {mi:.2f}<br>"
+                f"Circularity: {circ:.4f}<br>"
+                f"Centroid: ({cx:.1f}, {cy:.1f})"
+            )
+            # Hover-target radius in *data* pixels, converted to an
+            # approximate on-screen marker size so it roughly tracks the
+            # cell's real footprint after the image is scaled to fit the plot.
+            cell_radius_px = max(4.0, np.sqrt(region.area / np.pi))
+            marker_px      = np.clip(cell_radius_px * (render_px / longest_side) * 2,
+                                     10, 40)
+            fig.add_trace(go.Scatter(
+                x=[cx], y=[cy],
+                mode="markers",
+                marker=dict(
+                    size=marker_px,
+                    color="rgba(255,255,0,0.01)",   # near-invisible fill, but still hoverable
+                    line=dict(width=1.5, color="rgba(255,255,0,0.35)"),  # faint ring so hover targets are discoverable
+                ),
+                hovertemplate=hover_text + "<extra></extra>",
+                hoverlabel=dict(
+                    bgcolor="#1a1a1a",
+                    bordercolor="#ffd400",
+                    font=dict(color="#ffffff", size=13, family="Arial"),
+                ),
+                showlegend=False,
+            ))
+
+    fig.update_xaxes(
+        visible=False, range=[0, w],
+        constrain="domain",
+    )
+    fig.update_yaxes(
+        visible=False, range=[h, 0],   # invert y so image isn't flipped
+        scaleanchor="x", scaleratio=1,
+    )
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=30, b=0),
+        height=480,
+        paper_bgcolor="#111",
+        plot_bgcolor="#111",
+        font=dict(color="white"),
+        hoverlabel=dict(
+            bgcolor="#1a1a1a",
+            bordercolor="#ffd400",
+            font=dict(color="#ffffff", size=13, family="Arial"),
+        ),
+        hovermode="closest",
+        title=dict(
+            text=f"Detected = {len(results_df)}  |  Channel = {ch_name}  (hover over a cell for details)",
+            font=dict(color="white", size=13),
+        ),
+    )
+    return fig
+
+
 def spatial_distribution_score(centroids, img_shape):
     n = len(centroids)
     if n < 2:
@@ -195,7 +291,7 @@ def show_channel_section(title_html, ch_name, img_array, overlay, valid_cells, l
     n = len(results_df)
 
 
-    # ── annotated image ──
+    # ── annotated image (static, for the download button) ──
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
     fig.patch.set_facecolor('#111')
     orig = img_array[:, :, :3] if img_array.ndim == 3 else img_array
@@ -210,18 +306,32 @@ def show_channel_section(title_html, ch_name, img_array, overlay, valid_cells, l
     axes[1].axis('off')
     plt.tight_layout(pad=0.4)
 
-    ic, dc = st.columns([4, 1])
-    with ic:
-        st.pyplot(fig, use_container_width=True)
-    with dc:
-        st.markdown("<br><br><br>", unsafe_allow_html=True)
-        st.download_button(
-            f"⬇️ Download Image",
-            data=fig_to_bytes(fig),
-            file_name=f"{file_prefix}_annotated.png",
-            mime="image/png",
-            key=f"dl_img_{file_prefix}",
+    # ── interactive view: original (static) + detected (hover for details) ──
+    ic1, ic2 = st.columns(2)
+    with ic1:
+        fig_orig, ax_orig = plt.subplots(figsize=(7, 6))
+        fig_orig.patch.set_facecolor('#111')
+        ax_orig.imshow(orig, cmap='gray' if img_array.ndim == 2 else None)
+        ax_orig.set_title("Original", color='white', fontsize=12)
+        ax_orig.axis('off')
+        st.pyplot(fig_orig, use_container_width=True)
+        plt.close(fig_orig)
+    with ic2:
+        st.caption("🖱️ Hover over a cell in the image below to see its details")
+        interactive_fig = build_interactive_overlay(
+            overlay, valid_cells, results_df, area_col,
+            ch_name, use_microns, scale_px_per_um
         )
+        st.plotly_chart(interactive_fig, use_container_width=True,
+                        key=f"plotly_overlay_{file_prefix}")
+
+    st.download_button(
+        f"⬇️ Download Annotated Image (PNG)",
+        data=fig_to_bytes(fig),
+        file_name=f"{file_prefix}_annotated.png",
+        mime="image/png",
+        key=f"dl_img_{file_prefix}",
+    )
     plt.close(fig)
 
     # ── measurements table ──
