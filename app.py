@@ -12,17 +12,17 @@ from skimage.segmentation import find_boundaries
 import io
 import warnings
 warnings.filterwarnings('ignore')
-
+ 
 # ─────────────────────────────────────────────────
 #  PAGE CONFIG
 # ─────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Cell Analysis Tool",
+    page_title="Cell Viability Analyser",
     page_icon="🔬",
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
+ 
 st.markdown("""
 <style>
     .main-header { font-size:2rem; font-weight:700; color:#1a7a4a; margin-bottom:0.2rem; }
@@ -31,45 +31,28 @@ st.markdown("""
         font-size:1.1rem; font-weight:600; color:#1a7a4a;
         border-bottom:2px solid #c8e6d0; padding-bottom:4px; margin:1.2rem 0 0.8rem 0;
     }
+    .section-title-red {
+        font-size:1.1rem; font-weight:600; color:#b03030;
+        border-bottom:2px solid #f5c0c0; padding-bottom:4px; margin:1.2rem 0 0.8rem 0;
+    }
+    .section-title-green {
+        font-size:1.1rem; font-weight:600; color:#1a7a4a;
+        border-bottom:2px solid #c8e6d0; padding-bottom:4px; margin:1.2rem 0 0.8rem 0;
+    }
 </style>
 """, unsafe_allow_html=True)
-
-
+ 
+ 
 # ─────────────────────────────────────────────────
 #  HELPERS
 # ─────────────────────────────────────────────────
-
+ 
 def load_image(uploaded_file):
     return np.array(Image.open(uploaded_file))
-
-
-def detect_channel(img_array):
-    """Return best channel name + per-channel mean intensities."""
-    if img_array.ndim == 2:
-        return 'grayscale', {}
-
-    nc = img_array.shape[2]
-    names = ['red', 'green', 'blue', 'alpha'][:nc]
-    ch = {}
-    for i, name in enumerate(names):
-        arr = img_array[:, :, i].astype(np.float32)
-        nz  = arr[arr > 0]
-        ch[name] = float(nz.mean()) if len(nz) else 0.0
-
-    active = {k: v for k, v in ch.items() if k != 'alpha'}
-    if not any(v > 0 for v in active.values()):
-        return 'unknown', ch
-
-    values = sorted(active.values(), reverse=True)
-    best   = max(active, key=lambda k: active[k])
-
-    if len(values) > 1 and values[1] > 0 and values[0] / values[1] < 1.5:
-        return 'unknown', ch
-
-    return best, ch
-
-
+ 
+ 
 def extract_channel(img_array, channel):
+    """Extract named channel as float32 2-D array."""
     if img_array.ndim == 2:
         return img_array.astype(np.float32)
     cmap = {'red': 0, 'green': 1, 'blue': 2}
@@ -77,92 +60,81 @@ def extract_channel(img_array, channel):
         return img_array[:, :, cmap[channel]].astype(np.float32)
     nc = min(img_array.shape[2], 3)
     return img_array[:, :, :nc].mean(axis=2).astype(np.float32)
-
-
-def get_region_mean_intensity(region):
-    """Compatible accessor for skimage ≥0.26 and older."""
+ 
+ 
+def get_mi(region):
     try:
         return region.intensity_mean
     except AttributeError:
         return region.mean_intensity
-
-
+ 
+ 
 def segment_cells(cell_channel, min_area, min_circ, max_circ,
                   min_intensity, threshold_method='otsu', manual_threshold=None):
     thresh = manual_threshold if (threshold_method == 'manual' and manual_threshold is not None) \
              else threshold_otsu(cell_channel)
-
     binary = cell_channel > thresh
-    # remove_small_objects max_size = min_area-1 keeps objects >= min_area
     binary = remove_small_objects(binary, max_size=max(5, min_area // 2 - 1))
     labels = label(binary)
-
     valid = []
     for region in regionprops(labels, intensity_image=cell_channel):
         area  = region.area
         perim = region.perimeter
         circ  = (4 * np.pi * area) / (perim ** 2) if perim > 0 else 0
-        mi    = get_region_mean_intensity(region)
-
-        if (area >= min_area
-                and min_circ <= circ <= max_circ
-                and mi >= min_intensity):
+        mi    = get_mi(region)
+        if area >= min_area and min_circ <= circ <= max_circ and mi >= min_intensity:
             valid.append((region, circ))
-
     return labels, thresh, valid
-
-
+ 
+ 
 def build_overlay(img_array, labels, valid_cells, outline_color):
+    """Draw outlines on a display-safe RGB copy of the image."""
     if img_array.ndim == 2:
         disp = np.stack([img_array] * 3, axis=-1)
     else:
         disp = img_array[:, :, :3].copy()
-
     if disp.dtype != np.uint8:
         pmax = disp.max()
         disp = ((disp / pmax) * 255).astype(np.uint8) if pmax > 0 else disp.astype(np.uint8)
-
-    color_map = {'yellow': [255,255,0], 'cyan': [0,255,255],
-                 'magenta': [255,0,255], 'white': [255,255,255]}
-    color = color_map.get(outline_color, [255,255,0])
-
+ 
+    color_map = {
+        'yellow':  [255, 255,   0],
+        'cyan':    [  0, 255, 255],
+        'magenta': [255,   0, 255],
+        'white':   [255, 255, 255],
+        'red':     [255,  50,  50],
+        'green':   [ 50, 255,  50],
+    }
+    color = color_map.get(outline_color, [255, 255, 0])
     for region, _ in valid_cells:
-        mask         = np.zeros(labels.shape, dtype=bool)
-        mask[region.coords[:,0], region.coords[:,1]] = True
-        outline      = find_boundaries(mask, mode='outer')
+        mask = np.zeros(labels.shape, dtype=bool)
+        mask[region.coords[:, 0], region.coords[:, 1]] = True
+        outline = find_boundaries(mask, mode='outer')
         disp[outline] = color
-
     return disp
-
-
+ 
+ 
 def spatial_distribution_score(centroids, img_shape):
-    """Clark-Evans index normalised to [0, 1]."""
     n = len(centroids)
     if n < 2:
         return 0.0
-
     pts = np.array(centroids)
-
     if n == 2:
         d = np.linalg.norm(pts[0] - pts[1])
-        diag = np.hypot(img_shape[0], img_shape[1])
-        return round(min(1.0, d / (diag / 2)), 4)
-
+        return round(min(1.0, d / np.hypot(img_shape[0], img_shape[1]) * 2), 4)
     area    = img_shape[0] * img_shape[1]
     density = n / area
     expected_nn = 1.0 / (2 * np.sqrt(density))
-
     nn_dists = []
     for i, p in enumerate(pts):
         others = np.concatenate([pts[:i], pts[i+1:]], axis=0)
         nn_dists.append(np.min(np.linalg.norm(others - p, axis=1)))
-
-    R = np.mean(nn_dists) / expected_nn          # ~0 clustered → ~2.15 dispersed
+    R = np.mean(nn_dists) / expected_nn
     return round(float(np.clip(R / 2.15, 0, 1)), 4)
-
-
+ 
+ 
 def build_results_df(valid_cells, use_microns=False, scale_px_per_um=None):
-    px_to_um2 = (1.0 / scale_px_per_um**2) if (use_microns and scale_px_per_um) else None
+    px_to_um2 = (1.0 / scale_px_per_um ** 2) if (use_microns and scale_px_per_um) else None
     area_col  = "Area (µm²)" if px_to_um2 else "Area (px²)"
     rows = []
     for idx, (region, circ) in enumerate(valid_cells, 1):
@@ -170,261 +142,400 @@ def build_results_df(valid_cells, use_microns=False, scale_px_per_um=None):
         rows.append({
             "Cell #":         idx,
             area_col:         round(float(area_val), 4) if px_to_um2 else int(area_val),
-            "Mean Intensity": round(float(get_region_mean_intensity(region)), 2),
+            "Mean Intensity": round(float(get_mi(region)), 2),
             "Circularity":    round(circ, 4),
             "Centroid X":     round(region.centroid[1], 2),
             "Centroid Y":     round(region.centroid[0], 2),
         })
     return pd.DataFrame(rows), area_col
-
-
-def build_summary(df, area_col, cell_channel, valid_cells, img_shape, use_microns=False, scale_px_per_um=None):
+ 
+ 
+def build_channel_summary(df, area_col, cell_channel, valid_cells, img_shape,
+                          use_microns=False, scale_px_per_um=None):
     if df.empty:
         return pd.DataFrame()
-
-    total_px       = img_shape[0] * img_shape[1]
-    # % area always computed in pixels regardless of display unit
-    area_px_values = df[area_col] * (scale_px_per_um**2) if (use_microns and scale_px_per_um) else df[area_col]
-    cell_area_tot  = area_px_values.sum()
-    pct_area       = round(100.0 * cell_area_tot / total_px, 4)
-
-    cell_mask = np.zeros(img_shape[:2], dtype=bool)
+    total_px      = img_shape[0] * img_shape[1]
+    area_px_vals  = df[area_col] * (scale_px_per_um ** 2) if (use_microns and scale_px_per_um) else df[area_col]
+    pct_area      = round(100.0 * area_px_vals.sum() / total_px, 4)
+    cell_mask     = np.zeros(img_shape[:2], dtype=bool)
     for region, _ in valid_cells:
-        cell_mask[region.coords[:,0], region.coords[:,1]] = True
-    bg_intensity = float(cell_channel[~cell_mask].mean())
-
-    centroids = [(r.centroid[0], r.centroid[1]) for r, _ in valid_cells]
-    spatial   = spatial_distribution_score(centroids, img_shape)
-
-    area_label = f"Average Area (µm²)" if (use_microns and scale_px_per_um) else "Average Area (px²)"
-
+        cell_mask[region.coords[:, 0], region.coords[:, 1]] = True
+    bg_intensity  = float(cell_channel[~cell_mask].mean())
+    centroids     = [(r.centroid[0], r.centroid[1]) for r, _ in valid_cells]
+    spatial       = spatial_distribution_score(centroids, img_shape)
+    area_label    = "Average Area (µm²)" if (use_microns and scale_px_per_um) else "Average Area (px²)"
     return pd.DataFrame([{
-        "Total Cells Detected":        len(df),
-        area_label:                    round(float(df[area_col].mean()), 4),
-        "Average Circularity":         round(df["Circularity"].mean(), 4),
-        "Average Cell Intensity":      round(df["Mean Intensity"].mean(), 2),
-        "Average Background Intensity":round(bg_intensity, 2),
-        "% Area Occupied by Cells":    pct_area,
-        "Spatial Distribution (0–1)":  spatial,
+        "Total Cells Detected":         len(df),
+        area_label:                     round(float(df[area_col].mean()), 4),
+        "Average Circularity":          round(df["Circularity"].mean(), 4),
+        "Average Cell Intensity":       round(df["Mean Intensity"].mean(), 2),
+        "Average Background Intensity": round(bg_intensity, 2),
+        "% Area Occupied by Cells":     pct_area,
+        "Spatial Distribution (0–1)":   spatial,
     }])
-
-
+ 
+ 
 def df_to_csv_bytes(df):
     return df.to_csv(index=False).encode('utf-8')
-
-
+ 
+ 
 def fig_to_bytes(fig):
     buf = io.BytesIO()
     fig.savefig(buf, format='png', bbox_inches='tight', dpi=150)
     buf.seek(0)
     return buf.read()
-
-
+ 
+ 
+def show_channel_section(title_html, ch_name, img_array, valid_cells, labels,
+                         threshold_used, results_df, area_col, summary_df,
+                         use_microns, scale_px_per_um, cell_channel,
+                         outline_color, file_prefix):
+    """Render annotated image + tables for one channel."""
+    st.markdown(title_html, unsafe_allow_html=True)
+ 
+    overlay = build_overlay(img_array, labels, valid_cells, outline_color)
+    n       = len(results_df)
+ 
+    # ── annotated image ──
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig.patch.set_facecolor('#111')
+    orig = img_array[:, :, :3] if img_array.ndim == 3 else img_array
+    axes[0].imshow(orig, cmap='gray' if img_array.ndim == 2 else None)
+    axes[0].set_title("Original", color='white', fontsize=12)
+    axes[0].axis('off')
+    axes[1].imshow(overlay)
+    axes[1].set_title(
+        f"Detected = {n}  |  Threshold = {threshold_used:.1f}  |  Channel = {ch_name}",
+        color='white', fontsize=12
+    )
+    axes[1].axis('off')
+    plt.tight_layout(pad=0.4)
+ 
+    ic, dc = st.columns([4, 1])
+    with ic:
+        st.pyplot(fig, use_container_width=True)
+    with dc:
+        st.markdown("<br><br><br>", unsafe_allow_html=True)
+        st.download_button(
+            f"⬇️ Download Image",
+            data=fig_to_bytes(fig),
+            file_name=f"{file_prefix}_annotated.png",
+            mime="image/png",
+            key=f"dl_img_{file_prefix}",
+        )
+    plt.close(fig)
+ 
+    # ── measurements table ──
+    st.markdown(f"**Individual Cell Measurements — {ch_name} channel**")
+    if results_df.empty:
+        st.warning("No cells detected. Try adjusting sidebar parameters.")
+    else:
+        area_unit = "µm²" if (use_microns and scale_px_per_um) else "px²"
+        fmt = {
+            area_col:         "{:,.4f}" if (use_microns and scale_px_per_um) else "{:,}",
+            "Mean Intensity": "{:.2f}",
+            "Circularity":    "{:.4f}",
+            "Centroid X":     "{:.2f}",
+            "Centroid Y":     "{:.2f}",
+        }
+        st.dataframe(
+            results_df.style.format(fmt),
+            use_container_width=True,
+            height=min(380, 40 + 36 * n),
+        )
+        st.download_button(
+            f"🖨️ Download {ch_name} Cell Measurements CSV",
+            data=df_to_csv_bytes(results_df),
+            file_name=f"{file_prefix}_measurements.csv",
+            mime="text/csv",
+            key=f"dl_meas_{file_prefix}",
+        )
+ 
+    # ── channel summary ──
+    st.markdown(f"**Channel Summary — {ch_name}**")
+    if not summary_df.empty:
+        st.dataframe(summary_df.T.rename(columns={0: "Value"}), use_container_width=True)
+        st.download_button(
+            f"🖨️ Download {ch_name} Summary CSV",
+            data=df_to_csv_bytes(summary_df),
+            file_name=f"{file_prefix}_summary.csv",
+            mime="text/csv",
+            key=f"dl_sum_{file_prefix}",
+        )
+ 
+    # ── histogram ──
+    with st.expander(f"📈 {ch_name} Intensity Histogram"):
+        fig2, ax = plt.subplots(figsize=(8, 3))
+        hist_color = '#cc3333' if ch_name == 'Red' else '#1a7a4a'
+        ax.hist(cell_channel.ravel(), bins=128, color=hist_color, alpha=0.85)
+        ax.axvline(threshold_used, color='gold', linestyle='--', lw=1.5,
+                   label=f"Threshold = {threshold_used:.1f}")
+        ax.set_xlabel("Pixel Intensity")
+        ax.set_ylabel("Count")
+        ax.set_title(f"{ch_name} Channel Intensity Distribution")
+        ax.legend()
+        st.pyplot(fig2, use_container_width=True)
+        plt.close(fig2)
+ 
+ 
 # ─────────────────────────────────────────────────
 #  SIDEBAR
 # ─────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## ⚙️ Analysis Parameters")
-
+ 
     st.markdown("**Units**")
     use_microns = st.checkbox("Show area in µm²", value=False)
     scale_px_per_um = None
     if use_microns:
         scale_px_per_um = st.number_input(
             "Scale (pixels per µm)",
-            min_value=0.01,
-            max_value=1000.0,
-            value=1.0,
-            step=0.1,
-            help="Enter the pixel-to-micron scale for your microscope/objective. "
-                 "e.g. if 1 µm = 4.5 pixels, enter 4.5"
+            min_value=0.01, max_value=1000.0, value=1.0, step=0.1,
+            help="e.g. if 1 µm = 4.5 pixels, enter 4.5"
         )
-        st.caption(f"1 px² = {1/scale_px_per_um**2:.4f} µm²")
-
+        st.caption(f"1 px² = {1 / scale_px_per_um ** 2:.4f} µm²")
+ 
     st.markdown("**Segmentation Filters**")
-    # Min area slider — label and range switch with unit toggle
     if use_microns and scale_px_per_um:
-        um2_per_px2   = 1.0 / scale_px_per_um ** 2
-        min_area_um2  = st.slider(
+        um2_per_px2  = 1.0 / scale_px_per_um ** 2
+        min_area_um2 = st.slider(
             "Min Cell Area (µm²)",
-            min_value=round(10  * um2_per_px2, 4),
+            min_value=round(10   * um2_per_px2, 4),
             max_value=round(2000 * um2_per_px2, 2),
-            value=round(50  * um2_per_px2, 4),
-            step=round(10  * um2_per_px2, 4),
+            value=round(50       * um2_per_px2, 4),
+            step=round(10        * um2_per_px2, 4),
             format="%.4f",
         )
         st.caption(f"= {min_area_um2 / um2_per_px2:.0f} px²")
-        min_area = int(min_area_um2 / um2_per_px2)   # convert back to px for segmentation
+        min_area = int(min_area_um2 / um2_per_px2)
     else:
         min_area = st.slider("Min Cell Area (px²)", 10, 2000, 50, 10)
-
+ 
     min_circ      = st.slider("Min Circularity",    0.0, 1.0, 0.1, 0.01)
     max_circ      = st.slider("Max Circularity",    0.0, 1.0, 1.0, 0.01)
-    min_intensity = st.slider("Min Mean Intensity", 0,   255,  15,  1)
-
+    min_intensity = st.slider("Min Mean Intensity", 0,   255,  15,   1)
+ 
     st.markdown("**Thresholding**")
     thresh_method = st.radio("Method", ["Otsu (auto)", "Manual"], index=0)
     manual_thresh = None
     if thresh_method == "Manual":
         manual_thresh = st.slider("Manual Threshold", 0, 255, 30, 1)
-
+ 
     st.markdown("**Display**")
-    outline_color = st.selectbox("Outline Colour", ["yellow","cyan","magenta","white"])
-
-
+    st.caption("Outline colours are fixed: 🟢 Green channel · 🔴 Red channel")
+ 
+ 
 # ─────────────────────────────────────────────────
-#  MAIN
+#  MAIN UI
 # ─────────────────────────────────────────────────
-st.markdown('<div class="main-header">🔬 Microscopic Cell Analyser</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Upload a fluorescence or brightfield microscopy image to detect, measure, and summarise cells.</div>', unsafe_allow_html=True)
-
-c1, c2 = st.columns([3, 1])
-with c1:
-    uploaded = st.file_uploader(
-        "Upload image",
-        type=["tif","tiff","png","jpg","jpeg","bmp"],
+st.markdown('<div class="main-header">🔬 Cell Viability Analyser</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="sub-header">Upload a <b>green channel</b> image (live cells) and a '
+    '<b>red channel</b> image (dead cells) to analyse viability.</div>',
+    unsafe_allow_html=True
+)
+ 
+# ── Two upload boxes ──────────────────────────────
+col_g, col_r = st.columns(2)
+with col_g:
+    st.markdown("#### 🟢 Green Channel — Live Cells")
+    uploaded_green = st.file_uploader(
+        "Upload green channel image",
+        type=["tif", "tiff", "png", "jpg", "jpeg", "bmp"],
+        key="green_upload",
         label_visibility="collapsed",
     )
-with c2:
-    st.info("**Formats**\nTIF · PNG · JPG · BMP\nRGB · RGBA · Grayscale")
-
-if uploaded is None:
+    if uploaded_green:
+        st.success(f"✅ Loaded: {uploaded_green.name}")
+ 
+with col_r:
+    st.markdown("#### 🔴 Red Channel — Dead Cells")
+    uploaded_red = st.file_uploader(
+        "Upload red channel image",
+        type=["tif", "tiff", "png", "jpg", "jpeg", "bmp"],
+        key="red_upload",
+        label_visibility="collapsed",
+    )
+    if uploaded_red:
+        st.success(f"✅ Loaded: {uploaded_red.name}")
+ 
+# ── Guard — need at least one image ──────────────
+if uploaded_green is None and uploaded_red is None:
     st.markdown("---")
     st.markdown(
         "#### How to use\n"
-        "1. Upload a microscopy image above.\n"
-        "2. The app auto-detects the active fluorescence channel.\n"
-        "3. If ambiguous, choose Green / Red / Grayscale from the dropdown.\n"
-        "4. Tune parameters in the sidebar if needed.\n"
-        "5. Download annotated image or CSV reports with the buttons below results."
+        "1. Upload the **green channel** image (live/viable cells) on the left.\n"
+        "2. Upload the **red channel** image (dead cells) on the right.\n"
+        "3. You can upload just one channel if needed.\n"
+        "4. Adjust segmentation parameters in the sidebar.\n"
+        "5. Results for each channel appear below, followed by a combined viability summary."
     )
     st.stop()
-
-
-# ─── Load + channel selection ───────────────────
-img_array    = load_image(uploaded)
-auto_channel, ch_means = detect_channel(img_array)
-ndim_str     = f"shape {img_array.shape} · dtype {img_array.dtype}"
-
-if auto_channel == 'unknown' or (img_array.ndim > 2 and auto_channel not in ('red','green','blue','grayscale')):
-    st.warning(f"⚠️ Channel auto-detection inconclusive ({ndim_str}). Please select below.")
-    opts = ["Green","Red","Blue","Grayscale (average)"]
-    pick = st.selectbox("Select channel for cell detection", opts)
-    channel = 'gray' if 'Grayscale' in pick else pick.lower()
-else:
-    channel = auto_channel
-    st.success(f"✅ Auto-detected channel: **{channel.capitalize()}** — {ndim_str}")
-
-
-# ─── Analyse ─────────────────────────────────────
-with st.spinner("Analysing cells…"):
-    cell_channel = extract_channel(img_array, channel)
-    tm  = 'otsu' if thresh_method == "Otsu (auto)" else 'manual'
-    labels, threshold_used, valid_cells = segment_cells(
-        cell_channel, min_area, min_circ, max_circ, min_intensity,
-        threshold_method=tm, manual_threshold=manual_thresh
-    )
-    results_df, area_col = build_results_df(valid_cells, use_microns, scale_px_per_um)
-    summary_df  = build_summary(results_df, area_col, cell_channel, valid_cells, img_array.shape, use_microns, scale_px_per_um)
-    overlay_img = build_overlay(img_array, labels, valid_cells, outline_color)
-
-
-# ─── Quick metric row ────────────────────────────
+ 
+tm = 'otsu' if thresh_method == "Otsu (auto)" else 'manual'
+ 
+# ─────────────────────────────────────────────────
+#  ANALYSE BOTH CHANNELS
+# ─────────────────────────────────────────────────
+green_count = red_count = 0
+green_results = red_results = None
+ 
+with st.spinner("Analysing images…"):
+ 
+    if uploaded_green:
+        g_img    = load_image(uploaded_green)
+        g_ch     = extract_channel(g_img, 'green')
+        g_labels, g_thresh, g_valid = segment_cells(
+            g_ch, min_area, min_circ, max_circ, min_intensity,
+            threshold_method=tm, manual_threshold=manual_thresh
+        )
+        g_df, g_area_col = build_results_df(g_valid, use_microns, scale_px_per_um)
+        g_sum_df = build_channel_summary(g_df, g_area_col, g_ch, g_valid,
+                                         g_img.shape, use_microns, scale_px_per_um)
+        green_count   = len(g_df)
+        green_results = (g_img, g_ch, g_labels, g_thresh, g_valid, g_df, g_area_col, g_sum_df)
+ 
+    if uploaded_red:
+        r_img    = load_image(uploaded_red)
+        r_ch     = extract_channel(r_img, 'red')
+        r_labels, r_thresh, r_valid = segment_cells(
+            r_ch, min_area, min_circ, max_circ, min_intensity,
+            threshold_method=tm, manual_threshold=manual_thresh
+        )
+        r_df, r_area_col = build_results_df(r_valid, use_microns, scale_px_per_um)
+        r_sum_df = build_channel_summary(r_df, r_area_col, r_ch, r_valid,
+                                         r_img.shape, use_microns, scale_px_per_um)
+        red_count   = len(r_df)
+        red_results = (r_img, r_ch, r_labels, r_thresh, r_valid, r_df, r_area_col, r_sum_df)
+ 
+ 
+# ─────────────────────────────────────────────────
+#  TOP METRIC ROW
+# ─────────────────────────────────────────────────
 st.markdown("---")
-m1,m2,m3,m4,m5 = st.columns(5)
-n = len(results_df)
-area_unit = "µm²" if (use_microns and scale_px_per_um) else "px²"
-m1.metric("🦠 Cells",                    n)
-m2.metric(f"📐 Avg Area ({area_unit})",  f"{results_df[area_col].mean():.2f}"    if n else "—")
-m3.metric("⭕ Avg Circularity",          f"{results_df['Circularity'].mean():.3f}"   if n else "—")
-m4.metric("💡 Avg Intensity",            f"{results_df['Mean Intensity'].mean():.1f}" if n else "—")
-m5.metric("🗺️ Spatial Score",           f"{summary_df['Spatial Distribution (0–1)'].iloc[0]:.3f}" if n else "—")
-
-
-# ─── Annotated image ─────────────────────────────
-st.markdown('<div class="section-title">📸 Annotated Image — Detected Cell Outlines</div>', unsafe_allow_html=True)
-
-fig, axes = plt.subplots(1, 2, figsize=(16, 7))
-fig.patch.set_facecolor('#111')
-
-orig_disp = img_array[:,:,:3] if img_array.ndim==3 else img_array
-axes[0].imshow(orig_disp, cmap='gray' if img_array.ndim==2 else None)
-axes[0].set_title("Original Image", color='white', fontsize=13)
-axes[0].axis('off')
-
-axes[1].imshow(overlay_img)
-axes[1].set_title(
-    f"Detected Cells = {n}  |  Threshold = {threshold_used:.1f}  |  Channel = {channel.capitalize()}",
-    color='white', fontsize=13
+total_cells    = green_count + red_count
+survival_pct   = round(100.0 * green_count / total_cells, 2) if total_cells > 0 else 0.0
+dead_pct       = round(100.0 * red_count   / total_cells, 2) if total_cells > 0 else 0.0
+ 
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("🦠 Total Cells",        total_cells)
+m2.metric("🟢 Live (Green)",       green_count)
+m3.metric("🔴 Dead (Red)",         red_count)
+m4.metric("✅ Survival %",         f"{survival_pct}%")
+m5.metric("☠️ Death %",            f"{dead_pct}%")
+ 
+ 
+# ─────────────────────────────────────────────────
+#  GREEN CHANNEL SECTION
+# ─────────────────────────────────────────────────
+if green_results:
+    g_img, g_ch, g_labels, g_thresh, g_valid, g_df, g_area_col, g_sum_df = green_results
+    st.markdown("---")
+    show_channel_section(
+        title_html='<div class="section-title-green">🟢 Green Channel — Live Cells</div>',
+        ch_name="Green",
+        img_array=g_img,
+        valid_cells=g_valid,
+        labels=g_labels,
+        threshold_used=g_thresh,
+        results_df=g_df,
+        area_col=g_area_col,
+        summary_df=g_sum_df,
+        use_microns=use_microns,
+        scale_px_per_um=scale_px_per_um,
+        cell_channel=g_ch,
+        outline_color='green',
+        file_prefix='green_cells',
+    )
+ 
+ 
+# ─────────────────────────────────────────────────
+#  RED CHANNEL SECTION
+# ─────────────────────────────────────────────────
+if red_results:
+    r_img, r_ch, r_labels, r_thresh, r_valid, r_df, r_area_col, r_sum_df = red_results
+    st.markdown("---")
+    show_channel_section(
+        title_html='<div class="section-title-red">🔴 Red Channel — Dead Cells</div>',
+        ch_name="Red",
+        img_array=r_img,
+        valid_cells=r_valid,
+        labels=r_labels,
+        threshold_used=r_thresh,
+        results_df=r_df,
+        area_col=r_area_col,
+        summary_df=r_sum_df,
+        use_microns=use_microns,
+        scale_px_per_um=scale_px_per_um,
+        cell_channel=r_ch,
+        outline_color='red',
+        file_prefix='red_cells',
+    )
+ 
+ 
+# ─────────────────────────────────────────────────
+#  COMBINED VIABILITY SUMMARY
+# ─────────────────────────────────────────────────
+st.markdown("---")
+st.markdown('<div class="section-title">📋 Combined Viability Summary</div>', unsafe_allow_html=True)
+ 
+viability_data = {
+    "Total Cells (Green + Red)":   total_cells,
+    "Live Cells (Green Channel)":  green_count,
+    "Dead Cells (Red Channel)":    red_count,
+    "Survival Percentage (%)":     survival_pct,
+    "Death Percentage (%)":        dead_pct,
+}
+ 
+# Add per-channel averages if available
+if green_results and not g_sum_df.empty:
+    area_label = [c for c in g_sum_df.columns if "Area" in c]
+    if area_label:
+        viability_data["Avg Live Cell Area"] = round(float(g_sum_df[area_label[0]].iloc[0]), 4)
+    viability_data["Avg Live Cell Intensity"]    = round(float(g_sum_df["Average Cell Intensity"].iloc[0]), 2)
+    viability_data["Avg Live Cell Circularity"]  = round(float(g_sum_df["Average Circularity"].iloc[0]), 4)
+    viability_data["Live Cell Spatial Dist."]    = round(float(g_sum_df["Spatial Distribution (0–1)"].iloc[0]), 4)
+ 
+if red_results and not r_sum_df.empty:
+    area_label = [c for c in r_sum_df.columns if "Area" in c]
+    if area_label:
+        viability_data["Avg Dead Cell Area"] = round(float(r_sum_df[area_label[0]].iloc[0]), 4)
+    viability_data["Avg Dead Cell Intensity"]    = round(float(r_sum_df["Average Cell Intensity"].iloc[0]), 2)
+    viability_data["Avg Dead Cell Circularity"]  = round(float(r_sum_df["Average Circularity"].iloc[0]), 4)
+    viability_data["Dead Cell Spatial Dist."]    = round(float(r_sum_df["Spatial Distribution (0–1)"].iloc[0]), 4)
+ 
+viability_df = pd.DataFrame(list(viability_data.items()), columns=["Metric", "Value"])
+st.dataframe(viability_df.set_index("Metric"), use_container_width=True)
+ 
+st.download_button(
+    "🖨️ Download Combined Viability Summary CSV",
+    data=viability_df.to_csv(index=False).encode('utf-8'),
+    file_name="viability_summary.csv",
+    mime="text/csv",
+    key="dl_viability",
 )
-axes[1].axis('off')
-plt.tight_layout(pad=0.5)
-
-ic, dc = st.columns([4,1])
-with ic:
-    st.pyplot(fig, use_container_width=True)
-with dc:
-    st.markdown("<br><br><br>", unsafe_allow_html=True)
-    st.download_button("⬇️ Download Image", data=fig_to_bytes(fig),
-                       file_name="annotated_cells.png", mime="image/png")
-plt.close(fig)
-
-
-# ─── Cell measurements table ─────────────────────
-st.markdown('<div class="section-title">📊 Individual Cell Measurements</div>', unsafe_allow_html=True)
-
-if results_df.empty:
-    st.warning("No cells detected. Try reducing Min Area or Min Intensity in the sidebar.")
-else:
-    fmt = {
-        area_col:         "{:,.4f}" if (use_microns and scale_px_per_um) else "{:,}",
-        "Mean Intensity": "{:.2f}",
-        "Circularity":    "{:.4f}",
-        "Centroid X":     "{:.2f}",
-        "Centroid Y":     "{:.2f}",
-    }
-    st.dataframe(
-        results_df.style.format(fmt),
-        use_container_width=True,
-        height=min(420, 40 + 36*len(results_df)),
+ 
+# ── Viability bar chart ───────────────────────────
+if total_cells > 0:
+    fig3, ax3 = plt.subplots(figsize=(5, 3))
+    bars = ax3.bar(
+        ["Live (Green)", "Dead (Red)"],
+        [survival_pct, dead_pct],
+        color=['#2ecc71', '#e74c3c'],
+        width=0.4, edgecolor='white', linewidth=1.2
     )
-    st.download_button(
-        "🖨️ Download Cell Measurements CSV",
-        data=df_to_csv_bytes(results_df),
-        file_name="cell_measurements.csv",
-        mime="text/csv",
-    )
-
-
-# ─── Summary table ───────────────────────────────
-st.markdown('<div class="section-title">📋 Summary Statistics</div>', unsafe_allow_html=True)
-
-if not summary_df.empty:
-    st.dataframe(
-        summary_df.T.rename(columns={0:"Value"}),
-        use_container_width=True,
-    )
-    st.download_button(
-        "🖨️ Download Summary CSV",
-        data=df_to_csv_bytes(summary_df),
-        file_name="cell_summary.csv",
-        mime="text/csv",
-    )
-    st.markdown("""
-    > **Spatial Distribution (0–1)**: Clark-Evans nearest-neighbour index.  
-    > `0` = cells clustered at one spot · `1` = cells evenly spread across the surface.
-    """)
-
-
-# ─── Intensity histogram ─────────────────────────
-with st.expander("📈 Channel Intensity Histogram"):
-    fig2, ax = plt.subplots(figsize=(8,3))
-    ax.hist(cell_channel.ravel(), bins=128, color='#1a7a4a', alpha=0.85)
-    ax.axvline(threshold_used, color='red', linestyle='--', lw=1.5,
-               label=f"Threshold = {threshold_used:.1f}")
-    ax.set_xlabel("Pixel Intensity")
-    ax.set_ylabel("Count")
-    ax.set_title(f"Intensity Distribution — {channel.capitalize()} channel")
-    ax.legend()
-    st.pyplot(fig2, use_container_width=True)
-    plt.close(fig2)
+    for bar, val in zip(bars, [survival_pct, dead_pct]):
+        ax3.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                 f"{val:.1f}%", ha='center', va='bottom', fontsize=12, fontweight='bold')
+    ax3.set_ylabel("Percentage (%)")
+    ax3.set_title("Cell Viability", fontsize=13, fontweight='bold')
+    ax3.set_ylim(0, 115)
+    ax3.spines[['top', 'right']].set_visible(False)
+    plt.tight_layout()
+    st.pyplot(fig3, use_container_width=False)
+    plt.close(fig3)
+ 
+st.markdown("""
+> **Survival %** = Live cells (green) ÷ Total cells × 100  
+> **Spatial Distribution (0–1)**: `0` = clustered · `1` = evenly spread (Clark-Evans index)
+""")
